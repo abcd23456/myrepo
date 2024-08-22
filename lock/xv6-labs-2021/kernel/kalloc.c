@@ -26,12 +26,14 @@ struct {
 void
 kinit()
 {
-  char buf[10];
-  for (int i = 0; i < NCPU; i++)
+  for (int i = 0; i<NCPU; i++)
   {
-    snprintf(buf, 10, "kmem_CPU%d", i);
-    initlock(&kmem[i].lock, buf);
+    // char buf[9];
+    // snprintf(buf, 6, "kmem_%d", i);
+    // initlock(&kmem[i].lock, buf);
+    initlock(&kmem[i].lock, "kmem");
   }
+    
   freerange(end, (void*)PHYSTOP);
 }
 
@@ -52,6 +54,9 @@ void
 kfree(void *pa)
 {
   struct run *r;
+  push_off();
+  int c = cpuid();
+  pop_off();
 
   if(((uint64)pa % PGSIZE) != 0 || (char*)pa < end || (uint64)pa >= PHYSTOP)
     panic("kfree");
@@ -61,16 +66,10 @@ kfree(void *pa)
 
   r = (struct run*)pa;
 
-  // Ensure not interrupted while getting the CPU ID
-  push_off();
-  // Get the ID of the current CPU
-  int cpu = cpuid();
-  pop_off();
-
-  acquire(&kmem[cpu].lock);
-  r->next = kmem[cpu].freelist;
-  kmem[cpu].freelist = r;
-  release(&kmem[cpu].lock);
+  acquire(&kmem[c].lock);
+  r->next = kmem[c].freelist;
+  kmem[c].freelist = r;
+  release(&kmem[c].lock);
 }
 
 // Allocate one 4096-byte page of physical memory.
@@ -80,57 +79,33 @@ void *
 kalloc(void)
 {
   struct run *r;
-
   push_off();
-  int cpu = cpuid();
+  int c = cpuid();
   pop_off();
 
-  acquire(&kmem[cpu].lock);
-  r = kmem[cpu].freelist;
+  acquire(&kmem[c].lock);
+  r = kmem[c].freelist;
   if(r)
-    kmem[cpu].freelist = r->next;
-  else // add: steal page from other CPU
   {
-    struct run* tmp;
-
-    // Loop over all other CPUs in NCPU range
-    for (int i = 0; i < NCPU; ++i)
+    kmem[c].freelist = r->next;
+    release(&kmem[c].lock);
+  } else {
+    release(&kmem[c].lock);
+    for (int i = 0; i<NCPU; i++)
     {
-      if (i == cpu) // can't be itself
-        continue;
-
-      // Acquire a lock on its freelist to prevent contention.
       acquire(&kmem[i].lock);
-      tmp = kmem[i].freelist;
-      // no page to steal
-      if (tmp == 0) {
-        release(&kmem[i].lock);
-        continue;
-      } else {
-        for (int j = 0; j < 1024; j++) {
-          // steal 1024 pages
-          if (tmp->next)
-            tmp = tmp->next;
-          else
-            break;
-        }
-
-        // change freelist
-        kmem[cpu].freelist = kmem[i].freelist;
-        kmem[i].freelist = tmp->next;
-        tmp->next = 0;
-
+      r = kmem[i].freelist;
+      if(r)
+      {
+        kmem[i].freelist = r->next;
         release(&kmem[i].lock);
         break;
+      } else {
+        release(&kmem[i].lock);
       }
     }
-    r = kmem[cpu].freelist;
-    if (r)
-      kmem[cpu].freelist = r->next;
-  } // end steal page from other CPU
-  release(&kmem[cpu].lock);
-
+  }
   if(r)
-    memset((char*)r, 5, PGSIZE); // fill with junk
+    memset((char*)r, 5, PGSIZE);  // fill with junk
   return (void*)r;
 }

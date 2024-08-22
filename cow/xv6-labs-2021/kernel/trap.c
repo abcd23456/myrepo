@@ -15,6 +15,9 @@ extern char trampoline[], uservec[], userret[];
 void kernelvec();
 
 extern int devintr();
+extern pte_t *walk(pagetable_t, uint64, int);
+extern void *memmove(void *, const void *, uint);
+extern int mappages(pagetable_t, uint64, uint64, uint64, int);
 
 void
 trapinit(void)
@@ -29,42 +32,11 @@ trapinithart(void)
   w_stvec((uint64)kernelvec);
 }
 
-int
-cowhandler(pagetable_t pagetable, uint64 va)
-{
-    char *mem;
-    if (va >= MAXVA)
-      return -1;
-    pte_t *pte = walk(pagetable, va, 0);
-    if (pte == 0)
-      return -1;
-    // check the PTE
-    if ((*pte & PTE_RSW) == 0 || (*pte & PTE_U) == 0 || (*pte & PTE_V) == 0) {
-      return -1;
-    }
-    if ((mem = kalloc()) == 0) {
-      return -1;
-    }
-    // old physical address
-    uint64 pa = PTE2PA(*pte);
-    // copy old data to new mem
-    memmove((char*)mem, (char*)pa, PGSIZE);
-    // PAY ATTENTION
-    // decrease the reference count of old memory page, because a new page has been allocated
-    kfree((void*)pa);
-    uint flags = PTE_FLAGS(*pte);
-    // set PTE_W to 1, change the address pointed to by PTE to new memory page(mem)
-    *pte = (PA2PTE(mem) | flags | PTE_W);
-    // set PTE_RSW to 0
-    *pte &= ~PTE_RSW;
-    return 0;
-}
-
-
 //
 // handle an interrupt, exception, or system call from user space.
 // called from trampoline.S
 //
+extern uint8 referencecount[PHYSTOP/PGSIZE];
 void
 usertrap(void)
 {
@@ -97,22 +69,64 @@ usertrap(void)
     intr_on();
 
     syscall();
-  } else if (r_scause() == 15) {
-    // Store/AMO page fault(write page fault) and Load page fault
-    // see Volume II: RISC-V Privileged Architectures V20211203 Page 71
-
-    // the faulting virtual address
-    // see Volume II: RISC-V Privileged Architectures V20211203 Page 41
-    // the download url is https://github.com/riscv/riscv-isa-manual/releases/download/Priv-v1.12/riscv-privileged-20211203.pdf
-    uint64 va = r_stval();
-    if (va >= p->sz)
-      p->killed = 1;
-    int ret = cowhandler(p->pagetable, va);
-    if (ret != 0)
-      p->killed = 1;
   } else if((which_dev = devintr()) != 0){
     // ok
-  } else {
+  } else if (r_scause() == 12 || r_scause() == 15){
+    // deal with cow pages
+    pte_t *pte;
+    uint64 pa, va;
+    // uint64 va;
+    uint flags;
+    char *mem;
+
+    va = r_stval();
+    if(va >= MAXVA)
+    {
+      p->killed = 1;
+      exit(-1);
+    }
+      
+    if((pte = walk(p->pagetable, va, 0)) == 0)
+    {
+      // panic("cowhandler: pte should exist");
+      p->killed = 1;
+      exit(-1);
+    }
+    if((*pte & PTE_V) == 0)
+    {
+      // panic("cowhandler: page not present");
+      p->killed = 1;
+      exit(-1);
+    }
+    if((*pte & PTE_COW) == 0)
+    {
+      // panic("cowhandler: page not cow");
+      p->killed = 1;
+      exit(-1);
+    }
+
+    pa = PTE2PA(*pte);
+    flags = PTE_FLAGS(*pte) | PTE_W;
+    flags &= ~(PTE_COW);
+    // printf("cowhandler: scause=%d va=%p pa=%p\n",r_scause(),va,pa);
+    if((mem = kalloc()) == 0)
+    {
+      // printf("%d: cowhandler: kalloc failed, killed the process\n",p->pid);
+      p->killed = 1;
+      exit(-1);
+    }
+    // printf("%d: cowhandler: kalloc succeeded with pa=%p\n",p->pid,mem);
+    // printf("%d: cowhandler: uvmunmap succeeded with va=%p\n",p->pid,PGROUNDDOWN(va));
+    memmove(mem, (char*)pa, PGSIZE);
+    uvmunmap(p->pagetable, PGROUNDDOWN(va), 1, 1);
+    // printf("%d: cowhandler: memmove succeeded with from pa=%p to mem=%p\n",p->pid,pa,mem);
+    // if(mappages(p->pagetable, va, PGSIZE, (uint64)mem, flags) != 0){   <-------不知道为啥这个就不行
+    if(mappages(p->pagetable, PGROUNDDOWN(va), PGSIZE, (uint64)mem, flags) != 0){
+      kfree(mem);
+      panic("cowhandler: mappages failed");
+    }
+  }
+  else {
     printf("usertrap(): unexpected scause %p pid=%d\n", r_scause(), p->pid);
     printf("            sepc=%p stval=%p\n", r_sepc(), r_stval());
     p->killed = 1;
